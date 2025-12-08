@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import httpx
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -84,8 +86,8 @@ async def _require_vpn() -> None:
         raise HTTPException(status_code=503, detail="vpn_unavailable")
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     use_fake = os.environ.get("VDI_FAKE_BROWSER", "false").lower() == "true"
     globals()["USE_FAKE_BROWSER"] = use_fake
     if use_fake:
@@ -100,13 +102,15 @@ async def startup_event() -> None:
     resolved = _resolve_workspace_path()
     app.state.workspace_path = resolved
     globals()["VDI_WORKSPACE_PATH"] = resolved
+    try:
+        yield
+    finally:
+        runner_ref: BrowserRunner = app.state.browser_runner
+        if runner_ref:
+            await runner_ref.close()
 
 
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    runner: BrowserRunner = app.state.browser_runner
-    if runner:
-        await runner.close()
+app.router.lifespan_context = lifespan
 
 
 @app.get("/healthz")
