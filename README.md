@@ -34,6 +34,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OTEL_SDK_DISABLED=true python -m pytest
 - Probes renderer `/readyz`, intent-graph `/health`, and VPN `/readyz` for readiness.
 - Included in `unison-devstack/docker-compose.yml` sharing the `unison-network-vpn` network namespace.
 
+## Open tasks (VDI/VPN)
+- Storage/audit: replace KV upload shim with real storage file uploads; enrich audit with decision IDs, exit IP, domain; clean workspace after upload.
+- Policy/consent/auth: enforce JWT verification via `unison-auth`, consent references, and risk/scope gating across orchestrator → actuation → VDI.
+- Orchestrator wiring: update orchestrator/tooling to invoke actuation `/vdi/tasks/*` with documented payloads tied to skills/intents.
+- Security compose: mirror VPN/VDI wiring into `docker-compose.security.yml` with segmented networks.
+- CI/CD: add agent-vdi unit tests (with `VDI_FAKE_BROWSER=true`), build/publish VPN image tags, optional mini-stack integration asserting VPN readyz + VDI health with a test WG config.
+- Browser robustness: add retries/backoff, domain allow/deny controls, and credential/cookie handling via storage vault references.
+
 ## Docs
 
 Full docs at https://project-unisonos.github.io
