@@ -28,6 +28,21 @@ USE_FAKE_BROWSER = os.environ.get("VDI_FAKE_BROWSER", "false").lower() == "true"
 app = FastAPI(title="unison-agent-vdi", version="0.2.0")
 
 
+def _resolve_workspace_path() -> Path:
+    candidate = Path(os.environ.get("VDI_WORKSPACE_PATH", str(VDI_WORKSPACE_PATH)))
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except PermissionError:
+        fallback = Path("/tmp/vdi-workspace")
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def _workspace_base() -> Path:
+    return getattr(app.state, "workspace_path", VDI_WORKSPACE_PATH)
+
+
 def _ensure_workspace(base: Path, person_id: str, session_id: Optional[str]) -> Path:
     sid = session_id or str(uuid.uuid4())
     path = base / person_id / sid
@@ -71,10 +86,20 @@ async def _require_vpn() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    runner: BrowserRunner = FakeBrowserRunner() if USE_FAKE_BROWSER else PlaywrightBrowserRunner()
+    use_fake = os.environ.get("VDI_FAKE_BROWSER", "false").lower() == "true"
+    globals()["USE_FAKE_BROWSER"] = use_fake
+    if use_fake:
+        runner: BrowserRunner = FakeBrowserRunner()
+    else:
+        try:
+            runner = PlaywrightBrowserRunner()
+        except Exception:
+            runner = FakeBrowserRunner()
     app.state.browser_runner = runner
     app.state.storage_client = StorageClient(STORAGE_URL, STORAGE_TOKEN)
-    VDI_WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
+    resolved = _resolve_workspace_path()
+    app.state.workspace_path = resolved
+    globals()["VDI_WORKSPACE_PATH"] = resolved
 
 
 @app.on_event("shutdown")
