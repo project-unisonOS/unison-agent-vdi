@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import Dict, Optional
+from urllib.parse import urlparse
 
 import httpx
 from contextlib import asynccontextmanager
@@ -28,6 +30,67 @@ STORAGE_TOKEN = os.environ.get("STORAGE_TOKEN")
 USE_FAKE_BROWSER = os.environ.get("VDI_FAKE_BROWSER", "false").lower() == "true"
 
 app = FastAPI(title="unison-agent-vdi", version="0.2.0")
+
+
+def _domain_patterns(env_name: str) -> list[str]:
+    raw = os.environ.get(env_name, "")
+    patterns = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    return patterns
+
+
+def _host_matches_pattern(host: str, pattern: str) -> bool:
+    host = host.lower()
+    pattern = pattern.lower()
+    if not host or not pattern:
+        return False
+    if pattern.startswith("*."):
+        suffix = pattern[2:]
+        return host == suffix or host.endswith(f".{suffix}")
+    if pattern.startswith("."):
+        suffix = pattern[1:]
+        return host.endswith(f".{suffix}")
+    if "*" in pattern:
+        # Minimal wildcard support (fnmatch-like) without importing extra modules.
+        parts = pattern.split("*")
+        if len(parts) == 2:
+            return host.startswith(parts[0]) and host.endswith(parts[1])
+        # Fallback for multiple wildcards: conservative match.
+        idx = 0
+        for part in parts:
+            if not part:
+                continue
+            next_idx = host.find(part, idx)
+            if next_idx < 0:
+                return False
+            idx = next_idx + len(part)
+        return True
+    return host == pattern
+
+
+def _enforce_domain_policy(url: str) -> None:
+    allow = _domain_patterns("VDI_DOMAIN_ALLOWLIST")
+    deny = _domain_patterns("VDI_DOMAIN_DENYLIST")
+    parsed = urlparse(str(url))
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise HTTPException(status_code=400, detail="invalid_url")
+
+    if any(_host_matches_pattern(host, pattern) for pattern in deny):
+        raise HTTPException(status_code=403, detail="domain_denied")
+
+    if allow and not any(_host_matches_pattern(host, pattern) for pattern in allow):
+        raise HTTPException(status_code=403, detail="domain_not_allowed")
+
+
+def _should_clean_workspace() -> bool:
+    return os.environ.get("VDI_CLEAN_WORKSPACE", "false").lower() == "true"
+
+
+def _cleanup_workspace(path: Path) -> None:
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        return
 
 
 def _resolve_workspace_path() -> Path:
@@ -139,12 +202,19 @@ async def browse_task(
     _: None = Depends(_require_auth),
     __: None = Depends(_require_vpn),
 ) -> TaskResult:
+    _enforce_domain_policy(str(request.url))
     workspace = _ensure_workspace(VDI_WORKSPACE_PATH, request.person_id, request.session_id)
-    result = await browser.browse(request, workspace)
-    exit_ip = await vpn_ip(VPN_IP_ECHO_URL)
-    await _audit(storage, request.person_id, "browse", request.url, result.status)
-    result.exit_ip = exit_ip
-    return result
+    try:
+        result = await browser.browse(request, workspace)
+        exit_ip = await vpn_ip(VPN_IP_ECHO_URL)
+        await _audit(storage, request.person_id, "browse", request.url, result.status)
+        result.exit_ip = exit_ip
+        if _should_clean_workspace():
+            result.telemetry["workspace_cleaned"] = "true"
+        return result
+    finally:
+        if _should_clean_workspace():
+            _cleanup_workspace(workspace)
 
 
 @app.post("/tasks/form-submit", response_model=TaskResult)
@@ -155,12 +225,19 @@ async def form_submit_task(
     _: None = Depends(_require_auth),
     __: None = Depends(_require_vpn),
 ) -> TaskResult:
+    _enforce_domain_policy(str(request.url))
     workspace = _ensure_workspace(VDI_WORKSPACE_PATH, request.person_id, request.session_id)
-    result = await browser.submit_form(request, workspace)
-    exit_ip = await vpn_ip(VPN_IP_ECHO_URL)
-    await _audit(storage, request.person_id, "form_submit", request.url, result.status)
-    result.exit_ip = exit_ip
-    return result
+    try:
+        result = await browser.submit_form(request, workspace)
+        exit_ip = await vpn_ip(VPN_IP_ECHO_URL)
+        await _audit(storage, request.person_id, "form_submit", request.url, result.status)
+        result.exit_ip = exit_ip
+        if _should_clean_workspace():
+            result.telemetry["workspace_cleaned"] = "true"
+        return result
+    finally:
+        if _should_clean_workspace():
+            _cleanup_workspace(workspace)
 
 
 @app.post("/tasks/download", response_model=TaskResult)
@@ -171,26 +248,34 @@ async def download_task(
     _: None = Depends(_require_auth),
     __: None = Depends(_require_vpn),
 ) -> TaskResult:
+    _enforce_domain_policy(str(request.url))
     workspace = _ensure_workspace(VDI_WORKSPACE_PATH, request.person_id, request.session_id)
-    result = await browser.download(request, workspace)
-    stored_ids = []
-    for artifact in result.artifacts:
-        stored = await storage.upload_file(
-            Path(artifact),
-            metadata={
-                "person_id": request.person_id,
-                "session_id": request.session_id or "",
-                "source_url": str(request.url),
-                "artifact_id": Path(artifact).name,
-            },
-        )
-        if stored:
-            stored_ids.append(stored)
-    result.file_ids = stored_ids
-    exit_ip = await vpn_ip(VPN_IP_ECHO_URL)
-    await _audit(storage, request.person_id, "download", request.url, result.status, stored_ids)
-    result.exit_ip = exit_ip
-    return result
+    try:
+        result = await browser.download(request, workspace)
+        stored_ids = []
+        for artifact in result.artifacts:
+            stored = await storage.upload_file(
+                Path(artifact),
+                metadata={
+                    "person_id": request.person_id,
+                    "session_id": request.session_id or "",
+                    "source_url": str(request.url),
+                    "artifact_id": Path(artifact).name,
+                },
+            )
+            if stored:
+                stored_ids.append(stored)
+        result.file_ids = stored_ids
+        exit_ip = await vpn_ip(VPN_IP_ECHO_URL)
+        await _audit(storage, request.person_id, "download", request.url, result.status, stored_ids)
+        result.exit_ip = exit_ip
+        if _should_clean_workspace():
+            result.artifacts = []
+            result.telemetry["workspace_cleaned"] = "true"
+        return result
+    finally:
+        if _should_clean_workspace():
+            _cleanup_workspace(workspace)
 
 
 @app.get("/")
